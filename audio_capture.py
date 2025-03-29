@@ -2,6 +2,7 @@ import pyaudio
 import numpy as np
 import threading
 import time
+from contextlib import contextmanager
 
 class AudioCapture:
     def __init__(self, callback, rate=44100, chunk_size=4096, device_index=None):
@@ -13,47 +14,60 @@ class AudioCapture:
         self.stream = None
         self.is_running = False
         self.thread = None
+        
+        # Verificar si el dispositivo especificado es válido
+        if device_index is not None:
+            self._validate_device(device_index)
+    
+    def _validate_device(self, device_index):
+        """Verifica que el índice del dispositivo sea válido"""
+        try:
+            device_info = self.p.get_device_info_by_index(device_index)
+            if device_info['maxInputChannels'] <= 0:
+                print(f"Advertencia: El dispositivo {device_index} no tiene canales de entrada.")
+        except Exception as e:
+            print(f"Error al validar el dispositivo {device_index}: {e}")
+            print("Se utilizará el dispositivo predeterminado.")
+            self.device_index = None
     
     @staticmethod
     def list_audio_devices():
         """Listar todos los dispositivos de audio disponibles."""
-        p = pyaudio.PyAudio()
-        devices = []
-        
-        print("\nDispositivos de audio disponibles:")
-        print("----------------------------------")
-        
-        for i in range(p.get_device_count()):
-            dev_info = p.get_device_info_by_index(i)
-            dev_name = dev_info['name']
+        with AudioCapture._get_pyaudio() as p:
+            devices = []
             
-            # Corregir la codificación de caracteres en los nombres de dispositivos
-            try:
-                # Intentar decodificar correctamente el nombre del dispositivo
+            print("\nDispositivos de audio disponibles:")
+            print("----------------------------------")
+            
+            for i in range(p.get_device_count()):
+                dev_info = p.get_device_info_by_index(i)
+                dev_name = dev_info['name']
+                
+                # Manejo mejorado de codificación
                 if isinstance(dev_name, bytes):
-                    dev_name = dev_name.decode('utf-8')
-                # Si ya es string, asegurar que los caracteres especiales se manejen correctamente
-                elif isinstance(dev_name, str):
-                    # Intentar normalizar caracteres problemáticos comunes
-                    dev_name = dev_name.replace('Ã³', 'ó')
-                    dev_name = dev_name.replace('Ã©', 'é')
-                    dev_name = dev_name.replace('Ã¡', 'á')
-                    dev_name = dev_name.replace('Ã­', 'í')
-                    dev_name = dev_name.replace('Ãº', 'ú')
-                    dev_name = dev_name.replace('Ã±', 'ñ')
-            except UnicodeError:
-                # Si hay un error, usar el nombre tal cual
-                pass
+                    try:
+                        dev_name = dev_name.decode('utf-8', errors='replace')
+                    except Exception:
+                        dev_name = str(dev_name)
+                
+                inputs = dev_info['maxInputChannels']
+                
+                # Solo nos interesan dispositivos con entrada (para captura)
+                if inputs > 0:
+                    devices.append((i, dev_name))
+                    print(f"{i}: {dev_name} (Canales de entrada: {inputs})")
             
-            inputs = dev_info['maxInputChannels']
-            
-            # Solo nos interesan dispositivos con entrada (para captura)
-            if inputs > 0:
-                devices.append((i, dev_name))
-                print(f"{i}: {dev_name} (Canales de entrada: {inputs})")
-        
-        p.terminate()
-        return devices
+            return devices
+    
+    @staticmethod
+    @contextmanager
+    def _get_pyaudio():
+        """Contextmanager para asegurar que PyAudio se inicializa y termina correctamente"""
+        p = pyaudio.PyAudio()
+        try:
+            yield p
+        finally:
+            p.terminate()
     
     def start(self):
         if self.is_running:
