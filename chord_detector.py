@@ -20,13 +20,32 @@ class ChordDetector:
     }
     
     # Importancia relativa de cada intervalo para identificación de acordes
+    # Aumentamos significativamente el peso de las terceras para favorecer acordes mayores/menores
     INTERVAL_WEIGHTS = {
         0: 1.0,   # Raíz (tónica)
-        3: 0.8,   # Tercera menor
-        4: 0.8,   # Tercera mayor
-        7: 0.7,   # Quinta justa
+        3: 1.2,   # Tercera menor - Aumentamos su peso
+        4: 1.2,   # Tercera mayor - Aumentamos su peso
+        7: 0.8,   # Quinta justa
         10: 0.6,  # Séptima menor
         11: 0.6,  # Séptima mayor
+        2: 0.4,   # Segunda (para sus2) - Reducimos su peso
+        5: 0.4,   # Cuarta (para sus4) - Reducimos su peso
+    }
+    
+    # Prioridad de tipos de acordes (mayor valor = mayor prioridad)
+    CHORD_TYPE_PRIORITY = {
+        'major': 10,     # Mayor prioridad para acordes mayores
+        'minor': 9,      # Alta prioridad para acordes menores
+        'dominant7': 8,  
+        'major7': 7,
+        'minor7': 7,
+        'major6': 6,
+        'minor6': 6,
+        'diminished': 5,
+        'augmented': 4,
+        'add9': 3,
+        'sus4': 2,       # Baja prioridad para sus4
+        'sus2': 1,       # La prioridad más baja para sus2
     }
     
     # Notas musicales en orden cromático
@@ -37,6 +56,8 @@ class ChordDetector:
         # Para evitar cambios bruscos de acordes (memoria)
         self.previous_chord = None
         self.persistence_count = 0
+        # Umbral especial para acordes sus (debe ser más alto para evitar falsos positivos)
+        self.sus_threshold = confidence_threshold * 1.2
     
     def detect_chord(self, notes):
         if not notes or len(notes) < 2:  # Permitir detección con solo 2 notas
@@ -63,6 +84,7 @@ class ChordDetector:
         # Probar cada nota como raíz potencial del acorde
         best_score = 0
         best_chord = None
+        chord_candidates = []
         
         for root_idx, root_note in enumerate(unique_notes):
             # Reorganizar notas para que la posible raíz sea la primera
@@ -75,13 +97,36 @@ class ChordDetector:
             for chord_type, pattern in self.CHORD_PATTERNS.items():
                 match_score = self._calculate_match_score(intervals, pattern)
                 
-                # Si la puntuación es mayor que la mejor hasta ahora
-                if match_score > best_score:
-                    best_score = match_score
-                    best_chord = f"{root_note} {chord_type}"
+                # Si tiene buena puntuación, agregarlo como candidato
+                if match_score > 0.3:  # Umbral mínimo para considerar un candidato
+                    # Para acordes sus, requerir una puntuación más alta
+                    if chord_type.startswith('sus') and match_score < self.sus_threshold:
+                        continue
+                    
+                    # Aplicar bono de prioridad por tipo de acorde
+                    priority_bonus = self.CHORD_TYPE_PRIORITY.get(chord_type, 0) * 0.01
+                    adjusted_score = match_score + priority_bonus
+                    
+                    chord_candidates.append((f"{root_note} {chord_type}", adjusted_score))
+        
+        # Ordenar candidatos por puntuación (de mayor a menor)
+        chord_candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Seleccionar el mejor candidato
+        if chord_candidates:
+            best_chord, best_score = chord_candidates[0]
         
         # Solo actualizar el acorde anterior si tenemos suficiente confianza
         if best_score >= self.confidence_threshold:
+            # Verificación adicional: si el mejor acorde es "sus" y hay un acorde mayor/menor cercano,
+            # favorecer el acorde mayor/menor si la diferencia de puntuación es pequeña
+            if best_chord and ('sus' in best_chord):
+                for candidate, score in chord_candidates:
+                    if ('major' in candidate or 'minor' in candidate) and not 'sus' in candidate:
+                        if best_score - score < 0.1:  # Si la diferencia es pequeña
+                            best_chord = candidate
+                            break
+            
             self.previous_chord = best_chord
             self.persistence_count = 0
             return best_chord
@@ -134,28 +179,43 @@ class ChordDetector:
         score = 0.0
         
         # Verificar cuántos intervalos del patrón están presentes
+        pattern_matches = 0
         for interval in pattern_intervals:
             if interval in detected_intervals:
                 # Usar pesos para darle más importancia a ciertos intervalos
                 weight = self.INTERVAL_WEIGHTS.get(interval, 0.5)
                 score += weight
+                pattern_matches += 1
         
-        # Penalizar por intervalos adicionales que no pertenecen al patrón
-        extra_intervals = [i for i in detected_intervals if i not in pattern_intervals]
-        if extra_intervals:
-            # Penalizar menos si son intervalos posibles de extensiones
-            for interval in extra_intervals:
-                if interval in [2, 9, 13, 14]:  # 9ª, 2ª, 13ª, etc.
-                    score -= 0.1
-                else:
-                    score -= 0.2
+        # Fuerte penalización si falta la raíz o la quinta
+        if 0 not in detected_intervals:  # Falta la raíz
+            score -= 1.0
+        if 7 not in detected_intervals and 7 in pattern_intervals:  # Falta la quinta
+            score -= 0.5
+            
+        # Verificar si hay una tercera (3 o 4) para diferenciar mejor sus vs mayor/menor
+        has_third = (3 in detected_intervals) or (4 in detected_intervals)
+        has_sus_note = (2 in detected_intervals) or (5 in detected_intervals)
+        
+        # Si el patrón incluye una tercera y la detección incluye una tercera
+        if (3 in pattern_intervals or 4 in pattern_intervals) and has_third:
+            # Bono adicional para reforzar la detección de la tercera
+            score += 0.3
+            
+        # Si el patrón es sus pero hay una tercera, penalizar
+        if (2 in pattern_intervals or 5 in pattern_intervals) and has_third:
+            score -= 0.2
+        
+        # Si detectamos muy pocos de los intervalos del patrón, fuerte penalización
+        if pattern_matches < len(pattern_intervals) * 0.6:
+            score *= 0.7
         
         # Normalizar puntuación por el número de intervalos en el patrón
         normalized_score = score / len(pattern_intervals)
         
         # Bonus si todos los intervalos esenciales están presentes
         essential_intervals = [i for i in pattern_intervals if i in [0, 3, 4, 7]]  # Tónica, 3ra, 5ta
-        if all(i in detected_intervals for i in essential_intervals):
-            normalized_score += 0.2
-        
+        if essential_intervals and all(i in detected_intervals for i in essential_intervals):
+            normalized_score += 0.15
+            
         return normalized_score
